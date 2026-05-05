@@ -32,9 +32,13 @@ function question(rl, prompt) {
 // Afficher l'historique
 function printHistory() {
   console.log('\n=== HISTORIQUE DE LA CONVERSATION ===');
+  console.log(`Nombre total de messages: ${history.length}`);
   history.forEach((message, index) => {
     if (message.role === 'system') {
-      console.log(`[${index}] SYSTEM: ${message.content.substring(0, 100)}...`);
+      const preview = message.content.length > 100 
+        ? message.content.substring(0, 100) + '...' 
+        : message.content;
+      console.log(`[${index}] SYSTEM: ${preview}`);
     } else {
       console.log(`[${index}] ${message.role.toUpperCase()}: ${message.content}`);
     }
@@ -42,13 +46,40 @@ function printHistory() {
   console.log('=====================================\n');
 }
 
-// Fonction pour chat avec mémoire
-async function chat(userMessage) {
-  // 1. Ajout du message de l'utilisateur à l'historique
+// Fonction pour tester l'injection de prompt
+function checkPromptInjection(userMessage) {
+  const dangerousPatterns = [
+    /ignore.*instructions/i,
+    /oublie.*instructions/i,
+    /system.*prompt/i,
+    /instructions précédentes/i,
+    /reveal.*instructions/i
+  ];
+  
+  for (const pattern of dangerousPatterns) {
+    if (pattern.test(userMessage)) {
+      console.log('[🔒 Sécurité] Tentative d\'injection de prompt détectée et bloquée');
+      return true;
+    }
+  }
+  return false;
+}
+
+// Phase 3: Chat avec STREAMING
+async function chatStream(userMessage) {
+  // Vérification sécurité
+  if (checkPromptInjection(userMessage)) {
+    const securityResponse = "Je ne peux pas répondre à cette demande. Comment puis-je vous aider avec nos produits Acme Corp ?";
+    history.push({ role: 'assistant', content: securityResponse });
+    console.log(`IA : ${securityResponse}\n`);
+    return securityResponse;
+  }
+  
+  // Ajouter le message de l'utilisateur à l'historique
   history.push({ role: 'user', content: userMessage });
   
   try {
-    // 2. Envoie de l'historique à l'API
+    // Envoyer la requête avec stream: true
     const response = await fetch(MISTRAL_CONFIG.url, {
       method: 'POST',
       headers: {
@@ -57,7 +88,8 @@ async function chat(userMessage) {
       },
       body: JSON.stringify({
         model: MISTRAL_CONFIG.model,
-        messages: history,  // ← On envoie l'historique !
+        messages: history,
+        stream: true,  // ← Activation du streaming !
         temperature: 0.7
       })
     });
@@ -66,17 +98,59 @@ async function chat(userMessage) {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
 
-    const data = await response.json();
-    const assistantMessage = data.choices[0].message.content;
+    // Lire le stream
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let fullResponse = '';
     
-    // 3. Ajout de la réponse de l'assistant à l'historique
-    history.push({ role: 'assistant', content: assistantMessage });
+    process.stdout.write('IA : ');
     
-    return assistantMessage;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      
+      // Décoder le chunk
+      const chunk = decoder.decode(value);
+      const lines = chunk.split('\n');
+      
+      for (const line of lines) {
+        // Supprimer le préfixe 'data: '
+        if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+          try {
+            const data = JSON.parse(line.slice(6));
+            const delta = data.choices[0]?.delta?.content || '';
+            
+            if (delta) {
+              process.stdout.write(delta);  // Afficher token par token
+              fullResponse += delta;
+            }
+          } catch (e) {
+            // Ignorer les erreurs de parsing JSON
+            if (line !== 'data: ' && line !== '') {
+              // console.debug('Parse error:', e.message);
+            }
+          }
+        }
+      }
+    }
+    
+    console.log('\n');  // Nouvelle ligne après le streaming
+    
+    // Ajouter la réponse complète à l'historique
+    history.push({ role: 'assistant', content: fullResponse });
+    
+    // Afficher des métriques utiles
+    const tokenCount = Math.ceil(fullResponse.length / 4);  // Approximation
+    console.log(`[📊 Métriques] ~${tokenCount} tokens | Longueur: ${fullResponse.length} caractères\n`);
+    
+    return fullResponse;
     
   } catch (error) {
-    console.error('Erreur API:', error.message);
-    return "Désolé, une erreur s'est produite. Veuillez réessayer.";
+    console.error('\nErreur API:', error.message);
+    const errorMessage = "Désolé, une erreur s'est produite. Veuillez réessayer.";
+    history.push({ role: 'assistant', content: errorMessage });
+    console.log(`IA : ${errorMessage}\n`);
+    return errorMessage;
   }
 }
 
@@ -87,15 +161,18 @@ async function main() {
     output: process.stdout
   });
 
-  console.log('Chatbot CLI — Phase 2. (Ctrl+C pour quitter)');
-  console.log('Commande spéciale : /history pour voir l\'historique\n');
+  console.log('🚀 Chatbot CLI — Phase 3 (Streaming)');
+  console.log('📝 Commandes: /history, /exit, /quit');
+  console.log('💡 Les réponses apparaissent token par token !\n');
 
+  let messageCount = 0;
+  
   while (true) {
     const userMessage = await question(rl, 'Vous : ');
     
     // Quitter
     if (userMessage.toLowerCase() === 'exit' || userMessage.toLowerCase() === 'quit') {
-      console.log('Au revoir !');
+      console.log('\n👋 Au revoir !');
       rl.close();
       break;
     }
@@ -106,21 +183,35 @@ async function main() {
       continue;
     }
 
-    // Ignorer les messages vides
+    // Tester message vide
     if (userMessage.trim() === '') {
-      console.log('Veuillez entrer un message.\n');
+      console.log('⚠️  Veuillez entrer un message non vide.\n');
       continue;
     }
-
-    // Chat avec mémoire
-    const response = await chat(userMessage);
-    console.log(`IA : ${response}\n`);
+    
+    // Tester message très long
+    if (userMessage.length > 5000) {
+      console.log(`⚠️  Message très long (${userMessage.length} caractères). Envoi en cours...\n`);
+    }
+    
+    messageCount++;
+    
+    // Chat avec streaming
+    await chatStream(userMessage);
+    
+    // Alerte pour conversation longue
+    if (messageCount === 10) {
+      console.log('💡 Info: Vous êtes à 10 messages. La mémoire tient bien !\n');
+    }
+    if (messageCount === 20) {
+      console.log('💡 Info: 20 messages ! La mémoire fonctionne toujours.\n');
+    }
   }
 }
 
 // Gestion de Ctrl+C
 process.on('SIGINT', () => {
-  console.log('\n\nAu revoir !');
+  console.log('\n\n👋 Au revoir !');
   process.exit(0);
 });
 
