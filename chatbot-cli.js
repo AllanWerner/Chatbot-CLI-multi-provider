@@ -3,12 +3,24 @@ import readline from 'node:readline';
 
 dotenv.config();
 
-// Configuration Mistral
-const MISTRAL_CONFIG = {
-  url: 'https://api.mistral.ai/v1/chat/completions',
-  key: process.env.MISTRAL_API_KEY,
-  model: 'mistral-small-latest'
+// ==================== CONFIGURATION DES PROVIDERS ====================
+const PROVIDERS = {
+  mistral: {
+    url: 'https://api.mistral.ai/v1/chat/completions',
+    key: process.env.MISTRAL_API_KEY,
+    model: 'mistral-small-latest',
+    displayName: 'Mistral'
+  },
+  groq: {
+    url: 'https://api.groq.com/openai/v1/chat/completions',
+    key: process.env.GROQ_API_KEY,
+    model: 'llama-3.3-70b-versatile',
+    displayName: 'Groq'
+  }
 };
+
+// Provider actuel (démarre avec Mistral)
+let currentProvider = PROVIDERS.mistral;
 
 // Configuration du système
 const SYSTEM_PROMPT = `Tu es un assistant service client pour Acme Corp.
@@ -32,6 +44,7 @@ function question(rl, prompt) {
 // Afficher l'historique
 function printHistory() {
   console.log('\n=== HISTORIQUE DE LA CONVERSATION ===');
+  console.log(`Provider actuel: ${currentProvider.displayName} (${currentProvider.model})`);
   console.log(`Nombre total de messages: ${history.length}`);
   history.forEach((message, index) => {
     if (message.role === 'system') {
@@ -44,6 +57,30 @@ function printHistory() {
     }
   });
   console.log('=====================================\n');
+}
+
+// Changer de provider
+function switchProvider(providerName) {
+  if (PROVIDERS[providerName]) {
+    // Vérifier si la clé API est configurée
+    if (!PROVIDERS[providerName].key) {
+      console.log(`❌ Provider ${providerName} non configuré (clé API manquante dans .env)`);
+      return false;
+    }
+    
+    currentProvider = PROVIDERS[providerName];
+    console.log(`✅ Provider changé : ${currentProvider.displayName} (${currentProvider.model})`);
+    return true;
+  }
+  
+  console.log(`❌ Provider ${providerName} non trouvé. Providers disponibles: mistral, groq`);
+  return false;
+}
+
+// Afficher le provider actuel
+function showCurrentProvider() {
+  console.log(`📡 Provider actuel: ${currentProvider.displayName} (${currentProvider.model})`);
+  console.log(`🌐 URL: ${currentProvider.url}`);
 }
 
 // Fonction pour tester l'injection de prompt
@@ -65,7 +102,7 @@ function checkPromptInjection(userMessage) {
   return false;
 }
 
-// Phase 3: Chat avec STREAMING
+// Phase 3 & 4: Chat avec STREAMING et provider dynamique
 async function chatStream(userMessage) {
   // Vérification sécurité
   if (checkPromptInjection(userMessage)) {
@@ -78,24 +115,27 @@ async function chatStream(userMessage) {
   // Ajouter le message de l'utilisateur à l'historique
   history.push({ role: 'user', content: userMessage });
   
+  const startTime = Date.now();
+  
   try {
-    // Envoyer la requête avec stream: true
-    const response = await fetch(MISTRAL_CONFIG.url, {
+    // Envoyer la requête au provider actuel avec stream: true
+    const response = await fetch(currentProvider.url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${MISTRAL_CONFIG.key}`
+        'Authorization': `Bearer ${currentProvider.key}`
       },
       body: JSON.stringify({
-        model: MISTRAL_CONFIG.model,
+        model: currentProvider.model,
         messages: history,
-        stream: true,  // ← Activation du streaming !
+        stream: true,
         temperature: 0.7
       })
     });
 
     if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
+      const errorText = await response.text();
+      throw new Error(`HTTP ${response.status}: ${errorText}`);
     }
 
     // Lire le stream
@@ -103,7 +143,7 @@ async function chatStream(userMessage) {
     const decoder = new TextDecoder();
     let fullResponse = '';
     
-    process.stdout.write('IA : ');
+    process.stdout.write(`IA (${currentProvider.displayName}) : `);
     
     while (true) {
       const { done, value } = await reader.read();
@@ -114,40 +154,41 @@ async function chatStream(userMessage) {
       const lines = chunk.split('\n');
       
       for (const line of lines) {
-        // Supprimer le préfixe 'data: '
         if (line.startsWith('data: ') && line !== 'data: [DONE]') {
           try {
             const data = JSON.parse(line.slice(6));
             const delta = data.choices[0]?.delta?.content || '';
             
             if (delta) {
-              process.stdout.write(delta);  // Afficher token par token
+              process.stdout.write(delta);
               fullResponse += delta;
             }
           } catch (e) {
-            // Ignorer les erreurs de parsing JSON
-            if (line !== 'data: ' && line !== '') {
-              // console.debug('Parse error:', e.message);
-            }
+            // Ignorer les erreurs de parsing
           }
         }
       }
     }
     
-    console.log('\n');  // Nouvelle ligne après le streaming
+    console.log('\n');
     
     // Ajouter la réponse complète à l'historique
     history.push({ role: 'assistant', content: fullResponse });
     
-    // Afficher des métriques utiles
-    const tokenCount = Math.ceil(fullResponse.length / 4);  // Approximation
-    console.log(`[📊 Métriques] ~${tokenCount} tokens | Longueur: ${fullResponse.length} caractères\n`);
+    // Métriques
+    const latency = Date.now() - startTime;
+    const tokenCount = Math.ceil(fullResponse.length / 4);
+    console.log(`[📊 Métriques] Provider: ${currentProvider.displayName} | Latence: ${latency}ms | ~${tokenCount} tokens | ${fullResponse.length} caractères\n`);
     
     return fullResponse;
     
   } catch (error) {
-    console.error('\nErreur API:', error.message);
-    const errorMessage = "Désolé, une erreur s'est produite. Veuillez réessayer.";
+    console.error(`\n❌ Erreur avec ${currentProvider.displayName}:`, error.message);
+    
+    // Suggestion de changer de provider
+    console.log(`💡 Essayez de changer de provider avec /provider mistral ou /provider groq\n`);
+    
+    const errorMessage = `Désolé, une erreur est survenue avec ${currentProvider.displayName}. Veuillez réessayer ou changer de provider.`;
     history.push({ role: 'assistant', content: errorMessage });
     console.log(`IA : ${errorMessage}\n`);
     return errorMessage;
@@ -161,9 +202,10 @@ async function main() {
     output: process.stdout
   });
 
-  console.log('🚀 Chatbot CLI — Phase 3 (Streaming)');
-  console.log('📝 Commandes: /history, /exit, /quit');
-  console.log('💡 Les réponses apparaissent token par token !\n');
+  console.log('🚀 Chatbot CLI — Phase 4 (Multi-Provider avec Streaming)');
+  console.log('📝 Commandes: /history, /provider <name>, /current, /exit, /quit');
+  console.log('🎯 Providers disponibles: mistral, groq');
+  console.log(`📡 Provider actuel: ${currentProvider.displayName}\n`);
 
   let messageCount = 0;
   
@@ -182,30 +224,30 @@ async function main() {
       printHistory();
       continue;
     }
-
-    // Tester message vide
-    if (userMessage.trim() === '') {
-      console.log('⚠️  Veuillez entrer un message non vide.\n');
+    
+    // Commande /current - afficher le provider actuel
+    if (userMessage === '/current') {
+      showCurrentProvider();
       continue;
     }
     
-    // Tester message très long
-    if (userMessage.length > 5000) {
-      console.log(`⚠️  Message très long (${userMessage.length} caractères). Envoi en cours...\n`);
+    // Commande /provider <name>
+    if (userMessage.startsWith('/provider ')) {
+      const providerName = userMessage.split(' ')[1];
+      switchProvider(providerName);
+      continue;
+    }
+
+    // Message vide
+    if (userMessage.trim() === '') {
+      console.log('⚠️  Veuillez entrer un message non vide.\n');
+      continue;
     }
     
     messageCount++;
     
     // Chat avec streaming
     await chatStream(userMessage);
-    
-    // Alerte pour conversation longue
-    if (messageCount === 10) {
-      console.log('💡 Info: Vous êtes à 10 messages. La mémoire tient bien !\n');
-    }
-    if (messageCount === 20) {
-      console.log('💡 Info: 20 messages ! La mémoire fonctionne toujours.\n');
-    }
   }
 }
 
@@ -215,5 +257,23 @@ process.on('SIGINT', () => {
   process.exit(0);
 });
 
+// Vérification des clés API au démarrage
+function checkApiKeys() {
+  console.log('\n🔑 Vérification des clés API:');
+  if (process.env.MISTRAL_API_KEY) {
+    console.log('  ✅ Mistral API key présente');
+  } else {
+    console.log('  ❌ Mistral API key manquante');
+  }
+  
+  if (process.env.GROQ_API_KEY) {
+    console.log('  ✅ Groq API key présente');
+  } else {
+    console.log('  ❌ Groq API key manquante');
+  }
+  console.log('');
+}
+
 // Lancer le chatbot
+checkApiKeys();
 main();
