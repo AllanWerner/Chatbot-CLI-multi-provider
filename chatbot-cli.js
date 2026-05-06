@@ -8,7 +8,7 @@ const PROVIDERS = {
   mistral: {
     url: 'https://api.mistral.ai/v1/chat/completions',
     key: process.env.MISTRAL_API_KEY,
-    model: 'mistral-tiny',
+    model: 'mistral-small-latest',
     displayName: 'Mistral'
   },
   groq: {
