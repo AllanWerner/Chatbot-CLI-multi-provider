@@ -8,14 +8,16 @@ const PROVIDERS = {
   mistral: {
     url: 'https://api.mistral.ai/v1/chat/completions',
     key: process.env.MISTRAL_API_KEY,
-    model: 'mistral-tiny',
-    displayName: 'mistral-small-latest'
+    model: 'mistral-small-latest',
+    displayName: 'Mistral',
+    costPerToken: 0.00000025  // $0.25 par million de tokens (exemple)
   },
   groq: {
     url: 'https://api.groq.com/openai/v1/chat/completions',
     key: process.env.GROQ_API_KEY,
     model: 'llama-3.3-70b-versatile',
-    displayName: 'Groq'
+    displayName: 'Groq',
+    costPerToken: 0.0000007   // $0.70 par million de tokens (exemple)
   }
 };
 
@@ -36,9 +38,13 @@ let history = [
   { role: 'system', content: SYSTEM_PROMPT }
 ];
 
-// Statistiques de compression
+// Statistiques globales
 let compressionCount = 0;
 let totalMessagesCompressed = 0;
+let totalTokensUsed = 0;
+let totalCost = 0;
+let totalLatency = 0;
+let requestCount = 0;
 
 // Promisifier rl.question
 function question(rl, prompt) {
@@ -72,6 +78,71 @@ function printHistory() {
   console.log('=====================================\n');
 }
 
+// Phase 7: Commande /translate - Traduire le dernier message de l'assistant
+async function translateLast(targetLanguage) {
+  // Trouver le dernier message de l'assistant
+  const lastAssistantMessage = [...history].reverse().find(m => m.role === 'assistant');
+  
+  if (!lastAssistantMessage) {
+    console.log('📝 Aucun message de l\'assistant à traduire. Commencez une conversation d\'abord !\n');
+    return;
+  }
+  
+  console.log(`\n🌐 TRADUCTION VERS ${targetLanguage.toUpperCase()}...`);
+  console.log(`📝 Message original: "${lastAssistantMessage.content.substring(0, 100)}..."\n`);
+  
+  const translatePrompt = `Tu es un traducteur professionnel. Traduis le texte suivant en ${targetLanguage}.
+Règles :
+- Traduction précise et naturelle
+- Garde le ton et le style du message original
+- Ne réponds que par la traduction, sans aucun commentaire
+
+TEXTE À TRADUIRE :
+${lastAssistantMessage.content}
+
+TRADUCTION EN ${targetLanguage.toUpperCase()} :`;
+  
+  try {
+    const startTime = Date.now();
+    
+    // Appel API séparé pour la traduction (sans streaming, température très basse)
+    const response = await fetch(currentProvider.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${currentProvider.key}`
+      },
+      body: JSON.stringify({
+        model: currentProvider.model,
+        messages: [{ role: 'user', content: translatePrompt }],
+        temperature: 0.1,  // Température très basse pour une traduction précise
+        stream: false
+      })
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const data = await response.json();
+    const translation = data.choices[0].message.content;
+    const translationTime = Date.now() - startTime;
+    const tokensUsed = data.usage?.total_tokens || Math.ceil((lastAssistantMessage.content.length + translatePrompt.length) / 4);
+    
+    // Métriques
+    console.log(`📖 TRADUCTION (${targetLanguage}) :`);
+    console.log('═'.repeat(50));
+    console.log(translation);
+    console.log('═'.repeat(50));
+    console.log(`✨ Traduit en ${translationTime}ms | ~${tokensUsed} tokens | Provider: ${currentProvider.displayName}`);
+    console.log(`💰 Coût estimé: $${(tokensUsed * currentProvider.costPerToken).toFixed(8)}\n`);
+    
+  } catch (error) {
+    console.error(`❌ Erreur lors de la traduction:`, error.message);
+    console.log(`💡 Essayez avec l'autre provider si celui-ci ne fonctionne pas\n`);
+  }
+}
+
 // Phase 6: Commande /resume - Générer un résumé sans modifier l'historique
 async function resumeConversation() {
   if (history.length <= 1) {
@@ -81,29 +152,26 @@ async function resumeConversation() {
   
   console.log('\n📋 GÉNÉRATION DU RÉSUMÉ DE LA CONVERSATION...');
   
-  // Construire la conversation à résumer (exclure le system prompt)
   const conversationToSummarize = history.slice(1).map(msg => 
     `${msg.role === 'user' ? '👤 Utilisateur' : '🤖 Assistant'}: ${msg.content}`
   ).join('\n');
   
   const resumePrompt = `Tu es un assistant spécialisé dans l'analyse de conversations.
-Analyse la conversation suivante et génère un résumé en 5 bullet points maximum.
+    Analyse la conversation suivante et génère un résumé en 5 bullet points maximum.
 RÈGLES IMPORTANTES :
-- Chaque bullet point doit commencer par un VERBE d'action (ex: "Discuté", "Comparé", "Expliqué", "Demandé", "Répondu")
+- Chaque bullet point doit commencer par un VERBE d'action
 - Sois concis et précis
-- Couvre les sujets principaux, questions importantes, et informations clés
-- Ne mentionne pas les instructions système
-- Format: chaque bullet point sur une nouvelle ligne commençant par "- "
+    - Couvre les sujets principaux, questions importantes, et informations clés
+    - Format: chaque bullet point sur une nouvelle ligne commençant par "- "
 
-CONVERSATION À ANALYSER :
-${conversationToSummarize}
+    CONVERSATION À ANALYSER :
+    ${conversationToSummarize}
 
-RÉSUMÉ EN BULLET POINTS :`;
+    RÉSUMÉ EN BULLET POINTS :`;
   
   try {
     const startTime = Date.now();
     
-    // Appel API séparé pour le résumé (sans streaming, température basse)
     const response = await fetch(currentProvider.url, {
       method: 'POST',
       headers: {
@@ -113,7 +181,7 @@ RÉSUMÉ EN BULLET POINTS :`;
       body: JSON.stringify({
         model: currentProvider.model,
         messages: [{ role: 'user', content: resumePrompt }],
-        temperature: 0.3,  // Température basse pour un résumé cohérent
+        temperature: 0.3,
         stream: false
       })
     });
@@ -125,13 +193,14 @@ RÉSUMÉ EN BULLET POINTS :`;
     const data = await response.json();
     const summary = data.choices[0].message.content;
     const generationTime = Date.now() - startTime;
+    const tokensUsed = data.usage?.total_tokens || Math.ceil(conversationToSummarize.length / 4);
     
-    // Afficher le résumé
     console.log('\n📊 RÉSUMÉ DE LA CONVERSATION :');
     console.log('═'.repeat(50));
     console.log(summary);
     console.log('═'.repeat(50));
-    console.log(`✨ Généré en ${generationTime}ms | Provider: ${currentProvider.displayName}\n`);
+    console.log(`✨ Généré en ${generationTime}ms | ~${tokensUsed} tokens | Provider: ${currentProvider.displayName}`);
+    console.log(`💰 Coût estimé: $${(tokensUsed * currentProvider.costPerToken).toFixed(8)}\n`);
     
   } catch (error) {
     console.error(`❌ Erreur lors de la génération du résumé:`, error.message);
@@ -139,28 +208,23 @@ RÉSUMÉ EN BULLET POINTS :`;
   }
 }
 
-// Phase 5: Compression automatique de l'historique
+// Phase 5: Compression automatique
 async function compressHistory() {
   console.log('\n🔄 [COMPRESSION] Historique limite atteinte, compression en cours...');
   
-  // Construire la conversation à résumer (exclure le system prompt actuel)
   const conversationToCompress = history.slice(1).map(msg => 
     `${msg.role === 'user' ? '👤 Utilisateur' : '🤖 Assistant'}: ${msg.content}`
   ).join('\n');
   
-  const compressionPrompt = `Tu es un assistant spécialisé dans le résumé de conversations.
-Résume la conversation suivante en 3-5 phrases clés, en gardant les informations importantes (noms, préférences, sujets abordés, décisions prises).
-Ne répète pas les informations redondantes. Le résumé doit être concis mais complet.
+  const compressionPrompt = `Résume la conversation suivante en 3-5 phrases clés, en gardant les informations importantes :
 
-CONVERSATION À RÉSUMER :
 ${conversationToCompress}
 
-RÉSUMÉ (3-5 phrases) :`;
+RÉSUMÉ :`;
   
   try {
     const startTime = Date.now();
     
-    // Appel API séparé pour la compression (sans streaming, température basse)
     const response = await fetch(currentProvider.url, {
       method: 'POST',
       headers: {
@@ -170,7 +234,7 @@ RÉSUMÉ (3-5 phrases) :`;
       body: JSON.stringify({
         model: currentProvider.model,
         messages: [{ role: 'user', content: compressionPrompt }],
-        temperature: 0.3,  // Température basse pour un résumé cohérent
+        temperature: 0.3,
         stream: false
       })
     });
@@ -182,29 +246,28 @@ RÉSUMÉ (3-5 phrases) :`;
     const data = await response.json();
     const summary = data.choices[0].message.content;
     const compressionTime = Date.now() - startTime;
+    const tokensUsed = data.usage?.total_tokens || Math.ceil(conversationToCompress.length / 4);
     
-    // Sauvegarder le nombre de messages compressés
     const compressedCount = history.length - 1;
     totalMessagesCompressed += compressedCount;
     compressionCount++;
+    totalTokensUsed += tokensUsed;
+    totalCost += tokensUsed * currentProvider.costPerToken;
+    totalLatency += compressionTime;
+    requestCount++;
     
-    // Remplacer tout l'historique (sauf le premier system prompt) par le résumé
     history.splice(1, history.length - 1, { 
       role: 'system', 
       content: `📋 RÉSUMÉ DE LA CONVERSATION PRÉCÉDENTE (Compression #${compressionCount}) :
-${summary}
-
-IMPORTANT: Utilise ce résumé comme contexte pour continuer la conversation naturellment.`
+${summary}`
     });
     
     console.log(`✅ [COMPRESSION] Terminée en ${compressionTime}ms`);
     console.log(`   📊 ${compressedCount} messages → 1 résumé`);
-    console.log(`   📈 Total compressions: ${compressionCount}`);
-    console.log(`   💾 Nouvelle taille: ${history.length} messages\n`);
+    console.log(`   💰 Coût compression: $${(tokensUsed * currentProvider.costPerToken).toFixed(8)}\n`);
     
   } catch (error) {
     console.error(`❌ [COMPRESSION] Erreur:`, error.message);
-    console.log(`   ⚠️  Conservation de l'historique original\n`);
   }
 }
 
@@ -218,6 +281,7 @@ function switchProvider(providerName) {
     
     currentProvider = PROVIDERS[providerName];
     console.log(`✅ Provider changé : ${currentProvider.displayName} (${currentProvider.model})`);
+    console.log(`💰 Coût estimé: $${currentProvider.costPerToken * 1000000}/million tokens\n`);
     return true;
   }
   
@@ -229,9 +293,10 @@ function switchProvider(providerName) {
 function showCurrentProvider() {
   console.log(`📡 Provider actuel: ${currentProvider.displayName} (${currentProvider.model})`);
   console.log(`🌐 URL: ${currentProvider.url}`);
+  console.log(`💰 Coût: $${currentProvider.costPerToken * 1000000}/million tokens`);
 }
 
-// Fonction pour tester l'injection de prompt
+// Vérification injection
 function checkPromptInjection(userMessage) {
   const dangerousPatterns = [
     /ignore.*instructions/i,
@@ -252,9 +317,8 @@ function checkPromptInjection(userMessage) {
   return false;
 }
 
-// Chat avec STREAMING + compression automatique
+// Chat avec streaming
 async function chatStream(userMessage) {
-  // Vérification sécurité
   if (checkPromptInjection(userMessage)) {
     const securityResponse = "Je ne peux pas répondre à cette demande. Comment puis-je vous aider avec nos produits Acme Corp ?";
     history.push({ role: 'assistant', content: securityResponse });
@@ -262,21 +326,16 @@ async function chatStream(userMessage) {
     return securityResponse;
   }
   
-  // Vérifier si l'historique dépasse la limite AVANT d'ajouter le nouveau message
   const willExceedAfterResponse = (history.length + 2) > MAX_HISTORY;
-  
   if (willExceedAfterResponse) {
-    console.log(`⚠️  Limite d'historique approchée (${history.length}/${MAX_HISTORY})`);
     await compressHistory();
   }
   
-  // Ajouter le message de l'utilisateur à l'historique
   history.push({ role: 'user', content: userMessage });
   
   const startTime = Date.now();
   
   try {
-    // Envoyer la requête au provider actuel avec stream: true
     const response = await fetch(currentProvider.url, {
       method: 'POST',
       headers: {
@@ -292,20 +351,23 @@ async function chatStream(userMessage) {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`HTTP ${response.status}: ${errorText}`);
+      throw new Error(`HTTP ${response.status}`);
     }
 
-    // Lire le stream
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let fullResponse = '';
+    let firstTokenTime = null;
     
     process.stdout.write(`IA (${currentProvider.displayName}) : `);
     
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      
+      if (firstTokenTime === null) {
+        firstTokenTime = Date.now();
+      }
       
       const chunk = decoder.decode(value);
       const lines = chunk.split('\n');
@@ -320,51 +382,65 @@ async function chatStream(userMessage) {
               process.stdout.write(delta);
               fullResponse += delta;
             }
-          } catch (e) {
-            // Ignorer les erreurs de parsing
-          }
+          } catch (e) {}
         }
       }
     }
     
     console.log('\n');
     
-    // Ajouter la réponse complète à l'historique
     history.push({ role: 'assistant', content: fullResponse });
     
-    // Métriques
-    const latency = Date.now() - startTime;
+    // Métriques détaillées
+    const totalLatencyMs = Date.now() - startTime;
+    const timeToFirstToken = firstTokenTime ? firstTokenTime - startTime : totalLatencyMs;
     const tokenCount = Math.ceil(fullResponse.length / 4);
-    console.log(`[📊 Métriques] Provider: ${currentProvider.displayName} | Latence: ${latency}ms | ~${tokenCount} tokens | Historique: ${history.length}/${MAX_HISTORY} messages`);
+    const estimatedCost = tokenCount * currentProvider.costPerToken;
     
-    if (history.length >= MAX_HISTORY - 2) {
-      console.log(`⚠️  Attention: ${MAX_HISTORY - history.length} messages restants avant compression\n`);
-    } else {
-      console.log('');
-    }
+    // Mettre à jour les stats globales
+    totalTokensUsed += tokenCount;
+    totalCost += estimatedCost;
+    totalLatency += totalLatencyMs;
+    requestCount++;
+    
+    console.log(`[📊 MÉTRIQUES DÉTAILLÉES]`);
+    console.log(`   🤖 Provider: ${currentProvider.displayName}`);
+    console.log(`   ⏱️  Latence totale: ${totalLatencyMs}ms`);
+    console.log(`   🚀 Premier token: ${timeToFirstToken}ms`);
+    console.log(`   🔤 Tokens: ~${tokenCount}`);
+    console.log(`   💰 Coût: $${estimatedCost.toFixed(8)}`);
+    console.log(`   📊 Historique: ${history.length}/${MAX_HISTORY} messages`);
+    
+    // Statistiques globales
+    console.log(`\n[📈 STATS GLOBALES]`);
+    console.log(`   📨 Requêtes: ${requestCount}`);
+    console.log(`   🔤 Total tokens: ${totalTokensUsed}`);
+    console.log(`   💰 Coût total: $${totalCost.toFixed(6)}`);
+    console.log(`   ⏱️  Latence moyenne: ${Math.round(totalLatency / requestCount)}ms`);
+    console.log(`   🗜️  Compressions: ${compressionCount}\n`);
     
     return fullResponse;
     
   } catch (error) {
-    console.error(`\n❌ Erreur avec ${currentProvider.displayName}:`, error.message);
-    console.log(`💡 Essayez de changer de provider avec /provider mistral ou /provider groq\n`);
-    
-    const errorMessage = `Désolé, une erreur est survenue avec ${currentProvider.displayName}. Veuillez réessayer ou changer de provider.`;
+    console.error(`\n❌ Erreur:`, error.message);
+    const errorMessage = `Désolé, une erreur est survenue.`;
     history.push({ role: 'assistant', content: errorMessage });
     console.log(`IA : ${errorMessage}\n`);
     return errorMessage;
   }
 }
 
-// Afficher les statistiques
-function showStats() {
-  console.log('\n=== STATISTIQUES DU CHATBOT ===');
-  console.log(`📊 Historique: ${history.length}/${MAX_HISTORY} messages`);
+// Afficher les métriques globales
+function showGlobalMetrics() {
+  console.log('\n=== MÉTRIQUES GLOBALES ===');
+  console.log(`📨 Requêtes API: ${requestCount}`);
+  console.log(`🔤 Tokens totaux: ${totalTokensUsed}`);
+  console.log(`💰 Coût total: $${totalCost.toFixed(6)}`);
+  console.log(`⏱️  Latence moyenne: ${requestCount > 0 ? Math.round(totalLatency / requestCount) : 0}ms`);
   console.log(`🗜️  Compressions: ${compressionCount}`);
   console.log(`📦 Messages compressés: ${totalMessagesCompressed}`);
-  console.log(`👤 Provider: ${currentProvider.displayName}`);
-  console.log(`🤖 Modèle: ${currentProvider.model}`);
-  console.log('================================\n');
+  console.log(`💾 Historique actuel: ${history.length}/${MAX_HISTORY} messages`);
+  console.log('==========================\n');
 }
 
 // Boucle principale
@@ -374,93 +450,80 @@ async function main() {
     output: process.stdout
   });
 
-  console.log('🚀 Chatbot CLI — Phase 6 (Commande /resume)');
-  console.log('📝 Commandes: /history, /provider <name>, /current, /stats, /resume, /exit, /quit');
-  console.log(`🎯 Limite historique: ${MAX_HISTORY} messages (compression auto au-delà)`);
+  console.log('🚀 Chatbot CLI — Phase 7 (Traduction + Métriques complètes)');
+  console.log('📝 Commandes: /history, /provider <name>, /current, /stats, /resume, /translate <lang>, /metrics, /exit, /quit');
+  console.log(`🎯 Limite historique: ${MAX_HISTORY} messages`);
   console.log(`📡 Provider actuel: ${currentProvider.displayName}`);
-  console.log('💡 Nouveau: /resume pour un résumé en bullet points de la conversation\n');
+  console.log('🌐 Nouveau: /translate anglais/francais/espagnol/etc.\n');
 
-  let messageCount = 0;
-  
   while (true) {
     const userMessage = await question(rl, `Vous (${history.length}/${MAX_HISTORY}) : `);
     
-    // Quitter
     if (userMessage.toLowerCase() === 'exit' || userMessage.toLowerCase() === 'quit') {
       console.log('\n👋 Au revoir !');
-      showStats();
+      showGlobalMetrics();
       rl.close();
       break;
     }
 
-    // Commande /history
     if (userMessage === '/history') {
       printHistory();
       continue;
     }
     
-    // Commande /stats
-    if (userMessage === '/stats') {
-      showStats();
+    if (userMessage === '/stats' || userMessage === '/metrics') {
+      showGlobalMetrics();
       continue;
     }
     
-    // Commande /current
     if (userMessage === '/current') {
       showCurrentProvider();
       continue;
     }
     
-    // Phase 6: Commande /resume
     if (userMessage === '/resume') {
       await resumeConversation();
       continue;
     }
     
-    // Commande /provider
+    // Phase 7: Commande /translate
+    if (userMessage.startsWith('/translate ')) {
+      const targetLang = userMessage.substring(11).trim(); // Enlever '/translate '
+      if (targetLang) {
+        await translateLast(targetLang);
+      } else {
+        console.log('⚠️  Spécifiez une langue: /translate anglais\n');
+      }
+      continue;
+    }
+    
     if (userMessage.startsWith('/provider ')) {
       const providerName = userMessage.split(' ')[1];
       switchProvider(providerName);
       continue;
     }
 
-    // Message vide
     if (userMessage.trim() === '') {
       console.log('⚠️  Veuillez entrer un message non vide.\n');
       continue;
     }
     
-    messageCount++;
-    
-    // Chat avec streaming
     await chatStream(userMessage);
   }
 }
 
-// Gestion de Ctrl+C
 process.on('SIGINT', () => {
   console.log('\n\n👋 Au revoir !');
-  showStats();
+  showGlobalMetrics();
   process.exit(0);
 });
 
-// Vérification des clés API au démarrage
 function checkApiKeys() {
   console.log('\n🔑 Vérification des clés API:');
-  if (process.env.MISTRAL_API_KEY) {
-    console.log('  ✅ Mistral API key présente');
-  } else {
-    console.log('  ❌ Mistral API key manquante');
-  }
-  
-  if (process.env.GROQ_API_KEY) {
-    console.log('  ✅ Groq API key présente');
-  } else {
-    console.log('  ❌ Groq API key manquante');
-  }
+  console.log(`  ${process.env.MISTRAL_API_KEY ? '✅' : '❌'} Mistral API key`);
+  console.log(`  ${process.env.GROQ_API_KEY ? '✅' : '❌'} Groq API key`);
   console.log('');
 }
 
-// Lancer le chatbot
 checkApiKeys();
 main();
