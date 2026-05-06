@@ -8,8 +8,8 @@ const PROVIDERS = {
   mistral: {
     url: 'https://api.mistral.ai/v1/chat/completions',
     key: process.env.MISTRAL_API_KEY,
-    model: 'mistral-small-latest',
-    displayName: 'Mistral'
+    model: 'mistral-tiny',
+    displayName: 'mistral-small-latest'
   },
   groq: {
     url: 'https://api.groq.com/openai/v1/chat/completions',
@@ -72,6 +72,73 @@ function printHistory() {
   console.log('=====================================\n');
 }
 
+// Phase 6: Commande /resume - Générer un résumé sans modifier l'historique
+async function resumeConversation() {
+  if (history.length <= 1) {
+    console.log('📝 Pas assez de messages pour générer un résumé. Commencez une conversation d\'abord !\n');
+    return;
+  }
+  
+  console.log('\n📋 GÉNÉRATION DU RÉSUMÉ DE LA CONVERSATION...');
+  
+  // Construire la conversation à résumer (exclure le system prompt)
+  const conversationToSummarize = history.slice(1).map(msg => 
+    `${msg.role === 'user' ? '👤 Utilisateur' : '🤖 Assistant'}: ${msg.content}`
+  ).join('\n');
+  
+  const resumePrompt = `Tu es un assistant spécialisé dans l'analyse de conversations.
+Analyse la conversation suivante et génère un résumé en 5 bullet points maximum.
+RÈGLES IMPORTANTES :
+- Chaque bullet point doit commencer par un VERBE d'action (ex: "Discuté", "Comparé", "Expliqué", "Demandé", "Répondu")
+- Sois concis et précis
+- Couvre les sujets principaux, questions importantes, et informations clés
+- Ne mentionne pas les instructions système
+- Format: chaque bullet point sur une nouvelle ligne commençant par "- "
+
+CONVERSATION À ANALYSER :
+${conversationToSummarize}
+
+RÉSUMÉ EN BULLET POINTS :`;
+  
+  try {
+    const startTime = Date.now();
+    
+    // Appel API séparé pour le résumé (sans streaming, température basse)
+    const response = await fetch(currentProvider.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${currentProvider.key}`
+      },
+      body: JSON.stringify({
+        model: currentProvider.model,
+        messages: [{ role: 'user', content: resumePrompt }],
+        temperature: 0.3,  // Température basse pour un résumé cohérent
+        stream: false
+      })
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const data = await response.json();
+    const summary = data.choices[0].message.content;
+    const generationTime = Date.now() - startTime;
+    
+    // Afficher le résumé
+    console.log('\n📊 RÉSUMÉ DE LA CONVERSATION :');
+    console.log('═'.repeat(50));
+    console.log(summary);
+    console.log('═'.repeat(50));
+    console.log(`✨ Généré en ${generationTime}ms | Provider: ${currentProvider.displayName}\n`);
+    
+  } catch (error) {
+    console.error(`❌ Erreur lors de la génération du résumé:`, error.message);
+    console.log(`💡 Essayez avec l'autre provider si celui-ci ne fonctionne pas\n`);
+  }
+}
+
 // Phase 5: Compression automatique de l'historique
 async function compressHistory() {
   console.log('\n🔄 [COMPRESSION] Historique limite atteinte, compression en cours...');
@@ -122,7 +189,6 @@ RÉSUMÉ (3-5 phrases) :`;
     compressionCount++;
     
     // Remplacer tout l'historique (sauf le premier system prompt) par le résumé
-    // On garde le system prompt original et on ajoute le résumé comme nouveau contexte
     history.splice(1, history.length - 1, { 
       role: 'system', 
       content: `📋 RÉSUMÉ DE LA CONVERSATION PRÉCÉDENTE (Compression #${compressionCount}) :
@@ -186,7 +252,7 @@ function checkPromptInjection(userMessage) {
   return false;
 }
 
-// Phase 5: Chat avec STREAMING + compression automatique
+// Chat avec STREAMING + compression automatique
 async function chatStream(userMessage) {
   // Vérification sécurité
   if (checkPromptInjection(userMessage)) {
@@ -197,7 +263,6 @@ async function chatStream(userMessage) {
   }
   
   // Vérifier si l'historique dépasse la limite AVANT d'ajouter le nouveau message
-  // On garde de la place pour la réponse de l'assistant
   const willExceedAfterResponse = (history.length + 2) > MAX_HISTORY;
   
   if (willExceedAfterResponse) {
@@ -272,7 +337,6 @@ async function chatStream(userMessage) {
     const tokenCount = Math.ceil(fullResponse.length / 4);
     console.log(`[📊 Métriques] Provider: ${currentProvider.displayName} | Latence: ${latency}ms | ~${tokenCount} tokens | Historique: ${history.length}/${MAX_HISTORY} messages`);
     
-    // Alerte si on approche de la limite
     if (history.length >= MAX_HISTORY - 2) {
       console.log(`⚠️  Attention: ${MAX_HISTORY - history.length} messages restants avant compression\n`);
     } else {
@@ -292,7 +356,7 @@ async function chatStream(userMessage) {
   }
 }
 
-// Commande pour afficher les statistiques
+// Afficher les statistiques
 function showStats() {
   console.log('\n=== STATISTIQUES DU CHATBOT ===');
   console.log(`📊 Historique: ${history.length}/${MAX_HISTORY} messages`);
@@ -310,10 +374,11 @@ async function main() {
     output: process.stdout
   });
 
-  console.log('🚀 Chatbot CLI — Phase 5 (Compression automatique)');
-  console.log('📝 Commandes: /history, /provider <name>, /current, /stats, /exit, /quit');
+  console.log('🚀 Chatbot CLI — Phase 6 (Commande /resume)');
+  console.log('📝 Commandes: /history, /provider <name>, /current, /stats, /resume, /exit, /quit');
   console.log(`🎯 Limite historique: ${MAX_HISTORY} messages (compression auto au-delà)`);
-  console.log(`📡 Provider actuel: ${currentProvider.displayName}\n`);
+  console.log(`📡 Provider actuel: ${currentProvider.displayName}`);
+  console.log('💡 Nouveau: /resume pour un résumé en bullet points de la conversation\n');
 
   let messageCount = 0;
   
@@ -343,6 +408,12 @@ async function main() {
     // Commande /current
     if (userMessage === '/current') {
       showCurrentProvider();
+      continue;
+    }
+    
+    // Phase 6: Commande /resume
+    if (userMessage === '/resume') {
+      await resumeConversation();
       continue;
     }
     
